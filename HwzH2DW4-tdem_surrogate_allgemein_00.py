@@ -44,6 +44,19 @@ import simpeg.electromagnetics.time_domain as tdem
 # (hoehere Bandbreite = mehr Rauschen, aber auch schnelleres Signal).
 SENSOR_BW_HZ = 4000.0
 
+# --- Turn-off-Konfiguration (Totzeit-Schaetzung) ---
+# Ramp-off der Sendeschleife ueber TVS + Parallelwiderstand: Beim Oeffnen
+# des Schalters klemmt die TVS die induktive Spitze (~300 V), danach klingt
+# der Schleifenstrom exponentiell ueber den Parallelwiderstand ab.
+# Kanaele frueher als t_excl duerfen nicht invertiert werden (das Surrogate
+# ist auf idealen Step-off trainiert).
+LOOP_WIRE_RADIUS_M = 0.001        # Drahtradius der Sendeschleife (m)
+LOOP_N_TURNS = 1                  # Windungszahl der Sendeschleife
+TVS_CLAMP_VOLTAGE = 300.0         # Klemmspannung der TVS (V)
+R_PARALLEL_OHM = 2200.0           # Parallelwiderstand zur Schleife (Ohm, 2k2)
+COPPER_RESISTIVITY_OHM_M = 1.68e-8
+MU_0 = 4.0e-7 * np.pi
+
 
 # =============================================================================
 # KONFIGURATION - ALLE PARAMETER ZENTRAL HIER ANPASSEN
@@ -232,6 +245,66 @@ def generate_random_1d_model(n_layer,
         np.log10(sigma_range[0]), np.log10(sigma_range[1]), n_layer
     )
     return sigma_model
+
+
+def loop_inductance(radius_m, wire_radius_m=LOOP_WIRE_RADIUS_M,
+                    n_turns=LOOP_N_TURNS):
+    """Induktivitaet einer kreisfoermigen Sendeschleife (Henry).
+
+    Einturnig: L = mu0 * a * (ln(8a/r_w) - 2). Mehrturnig naehert sich
+    L ~ n_turns^2 * L_einturnig (enge Kopplung der Windungen).
+    """
+    l_single = MU_0 * radius_m * (np.log(8.0 * radius_m / wire_radius_m)
+                                  - 2.0)
+    return l_single * n_turns ** 2
+
+
+def loop_resistance(radius_m, wire_radius_m=LOOP_WIRE_RADIUS_M,
+                    n_turns=LOOP_N_TURNS):
+    """Ohm'scher Widerstand der Sendeschleife (Kupferdraht, rund)."""
+    wire_length = 2.0 * np.pi * radius_m * n_turns
+    cross_section = np.pi * wire_radius_m ** 2
+    return COPPER_RESISTIVITY_OHM_M * wire_length / cross_section
+
+
+def turnoff_exclusion_time(radius_m, current_a,
+                           clamp_voltage=TVS_CLAMP_VOLTAGE,
+                           r_parallel=R_PARALLEL_OHM,
+                           wire_radius_m=LOOP_WIRE_RADIUS_M,
+                           n_turns=LOOP_N_TURNS,
+                           residual_fraction=0.01):
+    """Totzeit nach dem Ramp-off: auszuschliessende Fruehzeit (Sekunden).
+
+    Zwei Phasen beim Abschalten (Schleife L, R_loop; TVS klemmt auf V_c;
+    Parallelwiderstand R_p):
+      1. Klempphase (TVS leitend): Strom faellt von I0 auf
+         I* = V_c/R_p (danach sperrt die TVS), mit
+         L*dI/dt = -(V_c + R_loop*I) geloest:
+             t_clamp = (L/R_loop) * ln((V_c + R_loop*I0)
+                                       / (V_c + R_loop*I*))
+      2. Exponentialer Abfall ueber R_loop + R_p mit tau = L/(R_loop+R_p)
+         bis auf residual_fraction von I*:
+             t_tail = tau * ln(1/residual_fraction)
+
+    Rueckgabe:
+        dict mit L, R_loop, tau, i_star, t_clamp, t_excl (= t_clamp+t_tail),
+        alle Zeiten in Sekunden. Faustformel: t_excl ~ L*I0/V_c, da
+        tau << t_clamp (Totzeit wird von der Klempphase dominiert).
+    """
+    L = loop_inductance(radius_m, wire_radius_m, n_turns)
+    R_loop = loop_resistance(radius_m, wire_radius_m, n_turns)
+    tau = L / (R_loop + r_parallel)
+    i_star = clamp_voltage / r_parallel
+    if current_a > i_star and R_loop > 0.0:
+        t_clamp = (L / R_loop) * np.log(
+            (clamp_voltage + R_loop * current_a)
+            / (clamp_voltage + R_loop * i_star)
+        )
+    else:
+        t_clamp = 0.0
+    t_excl = t_clamp + tau * np.log(1.0 / residual_fraction)
+    return {"L": L, "R_loop": R_loop, "tau": tau, "i_star": i_star,
+            "t_clamp": t_clamp, "t_excl": t_excl}
 
 
 def run_1d_tdem_forward(thicknesses, sigma_model, times,
@@ -1080,7 +1153,7 @@ class SurrogateInversion:
 
     def __init__(self, surrogate_model, times, device="cuda",
                  norm_stats=None, sigma_bounds=(1e-3, 10.0),
-                 radius=None, current=None):
+                 radius=None, current=None, dead_time=None):
         self.surrogate = surrogate_model.to(device)
         self.surrogate.eval()
         self.times = times
@@ -1113,6 +1186,20 @@ class SurrogateInversion:
             ).astype(np.float32)
         else:
             self.cond_norm = None
+        # Totzeit (Ramp-off via TVS + R_parallel): Kanaele mit t < dead_time
+        # werden in invert() hart aus der Misfit-Gewichtung genommen
+        # (Surrogate ist auf idealen Step-off trainiert; die Ramp-off-
+        # Kontamination ist systematisch, keine Rauschgewichtung).
+        # dead_time=None -> automatisch aus radius/current geschaetzt;
+        # dead_time=0 -> deaktiviert.
+        if dead_time is None and radius is not None and current is not None:
+            dead_time = turnoff_exclusion_time(radius, current)["t_excl"]
+        self.dead_time = 0.0 if dead_time is None else float(dead_time)
+        self.n_excluded = int(np.sum(
+            np.asarray(times, dtype=np.float64) < self.dead_time))
+        if self.dead_time > 0.0 and self.n_excluded > 0:
+            print(f"Totzeit {self.dead_time * 1e6:.1f} us: "
+                  f"{self.n_excluded}/{len(times)} Kanaele ausgeschlossen")
 
     def _normalize_input(self, sigma_model):
         """Leitfaehigkeiten (S/m) -> normalisierte Netzeingabe."""
@@ -1231,6 +1318,15 @@ class SurrogateInversion:
         else:
             inv_var = None
 
+        # Totzeit-Maske: Kanaele vor self.dead_time haben Gewicht 0
+        if self.dead_time > 0.0:
+            mask = torch.tensor(
+                (np.asarray(self.times, dtype=np.float64) >= self.dead_time)
+                .astype(np.float32),
+                dtype=torch.float32, device=self.device,
+            )
+            inv_var = mask if inv_var is None else inv_var * mask
+
         # Begrenzung auf den Trainingsbereich des Surrogates:
         # log10(sigma) in [log10(sigma_min), log10(sigma_max)].
         # Ohne Begrenzung treibt Rauschen die Optimierung in die
@@ -1276,10 +1372,12 @@ class SurrogateInversion:
 
                 # Daten-Misfit (im normalisierten Zielraum)
                 if inv_var is not None:
-                    # Chi-Quadrat: gewichtete mittlere quadratische Abw.
-                    data_misfit = torch.mean(
+                    # Chi-Quadrat: gewichtete mittlere quadratische Abw.,
+                    # normiert auf die Summe der Gewichte (bei Totzeit-Maske
+                    # also Mittel ueber die verbleibenden Kanaele)
+                    data_misfit = torch.sum(
                         inv_var * (prediction - observed) ** 2
-                    )
+                    ) / inv_var.sum().clamp_min(1e-12)
                 else:
                     data_misfit = nn.functional.mse_loss(prediction,
                                                          observed)
@@ -3059,6 +3157,21 @@ def run_pipeline(device="cuda"):
     # --- Phase 3: Inversion ---
     print(f"\n--- Phase 3: Inversion ({cfg['n_iterations']} Iterationen) ---")
 
+    # Totzeit (Ramp-off) fuer die Test-Geometrie; SurrogateInversion
+    # rechnet dieselbe Totzeit automatisch aus radius_test/current_test
+    t_off = turnoff_exclusion_time(
+        cfg.get("radius_test", cfg["radius"]),
+        cfg.get("current_test", cfg["current"]),
+    )
+    print(f"Totzeit Ramp-off (R={cfg.get('radius_test', cfg['radius'])} m, "
+          f"I={cfg.get('current_test', cfg['current'])} A): "
+          f"t_excl={t_off['t_excl'] * 1e6:.1f} us "
+          f"(t_clamp={t_off['t_clamp'] * 1e6:.1f} us, "
+          f"tau={t_off['tau'] * 1e6:.2f} us, "
+          f"L={t_off['L'] * 1e3:.3f} mH) -> "
+          f"{int(np.sum(times < t_off['t_excl']))}/{len(times)} Kanaele "
+          f"vor {t_off['t_excl'] * 1e6:.1f} us betroffen")
+
     # Synthetische "Felddaten": Proxy-Modell fuer steilstehendes Graphitfloez
     # (leitfaehige Zone in zufaelliger Tiefe, widerstaendiges Nebengestein)
     true_model = make_test_model(thicknesses, seed=42)
@@ -3098,6 +3211,7 @@ def run_pipeline(device="cuda"):
         "surrogate_rmse_log10": rmse,
         "surrogate_rmse_by_class": rmse_by_class,
         "final_train_loss": losses[-1],
+        "turnoff": {k: float(v) for k, v in t_off.items()},
         "true_model": true_model.tolist(),
         "layer_boundaries": np.cumsum(thicknesses).tolist(),
         "inverted_model": result.tolist(),
