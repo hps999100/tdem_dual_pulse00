@@ -78,7 +78,9 @@ DEV_MODE = True
 
 # Klassische SimPEG-Referenz-Inversion nach den Surrogate-Tests
 # (Validierung des Surrogates am Ende der Kette; minutenlang, daher
-#  abschaltbar). Laeuft im DEV-Lauf nach den Profil-Tests.
+#  abschaltbar). Wirkt als Fallback; in DEV_CONFIG/FULL_CONFIG ueber
+#  den Key "klassische_inversion" zentral steuerbar (DEV: False =
+#  schneller Iterationslauf ganz ohne SimPEG-Referenz).
 KLASSISCHE_INVERSION = True
 
 
@@ -130,6 +132,8 @@ DEV_CONFIG = {
     "reg_weight": 0.001,                     # Tikhonov-Gewicht
 
     # Phase 3D: Referenz-Inversion (SimPEG)
+    "klassische_inversion": False,           # False = SimPEG-Referenz aus
+                                             # (spart Minuten pro Lauf)
     "max_iter_simpeg": 150,                  # Iterationen der klassischen
                                              # Referenz-Inversion; sollte
                                              # bis zum TargetMisfit oder
@@ -188,6 +192,8 @@ FULL_CONFIG = {
     "station_spacing": 5.0,                  # Stationsabstand in m
 
     # Phase 3D: Referenz-Inversion (SimPEG)
+    "klassische_inversion": True,            # True = Referenz-Inversion mit
+                                             # SimPEG im Produktionslauf
     "max_iter_simpeg": 150,                  # s. DEV_CONFIG-Kommentar
 }
 
@@ -3030,6 +3036,7 @@ def run_pipeline(device="cuda"):
 
     cfg = CONFIG
     mode = "DEV MODE - Schnelltest" if DEV_MODE else "FULL MODE - Produktionslauf"
+    klassisch = cfg.get("klassische_inversion", KLASSISCHE_INVERSION)
 
     # Eigener zeitstempel-benannter Ordner fuer diesen Lauf
     run_dir = make_run_dir()
@@ -3328,7 +3335,7 @@ def run_pipeline(device="cuda"):
                 n_stacks=cfg.get("n_stacks", 32),
             n_restarts=cfg.get("n_restarts", 1),
                 output_prefix=os.path.join(run_dir, "profile"),
-                klassisch=KLASSISCHE_INVERSION,  # SimPEG je Station (~30 s)
+                klassisch=klassisch,             # SimPEG je Station (~30 s)
             )
 
     print("\n" + "=" * 60)
@@ -3339,7 +3346,7 @@ def run_pipeline(device="cuda"):
     # --- Phase 3E (optional): Klassische SimPEG-Referenz-Inversion ---
     # Vergleicht Surrogate- gegen SimPEG-Inversion auf denselben Daten
     # (Trennung von Surrogate-Fehler und Inversionsverhalten).
-    if KLASSISCHE_INVERSION:
+    if klassisch:
         print("\n" + "=" * 60)
         print("KLASSISCHE REFERENZ-INVERSION (SimPEG vs. Surrogate)")
         print("=" * 60)
